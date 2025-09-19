@@ -1,0 +1,219 @@
+# Azure DevOps Pipeline for Microsoft Entra ID to Port.io Group Synchronization
+# This pipeline syncs Microsoft Entra ID group members to Port.io by sending user invites
+#
+# Prerequisites:
+# 1. Create a Variable Group with the following secrets:
+#    - GRAPH_TENANT_ID
+#    - GRAPH_CLIENT_ID  
+#    - GRAPH_CLIENT_SECRET
+#    - PORT_API_TOKEN
+#
+# 2. Optional variables (can be set in Variable Group or Pipeline Variables):
+#    - GROUP_NAME (if not passed via webhook)
+#    - PORT_NOTIFY (true/false, default: true)
+#    - PORT_ROLE (role id/slug)
+#    - PORT_TEAM_IDS (comma-separated team IDs)
+#    - DRY_RUN (true/false, default: false)
+#    - VERBOSE (true/false, default: false)
+#
+# 3. For webhook integration:
+#    - Configure Port.io to call Azure DevOps service hook
+#    - Webhook payload will be written to $(Build.SourcesDirectory)/payload.json
+
+trigger: none  # Typically triggered by service hook or manual run
+
+variables:
+  # Variable group containing secrets
+  - group: 'Port-Sync-Secrets'  # Replace with your variable group name
+  
+  # Default values for optional variables
+  - name: PORT_NOTIFY
+    value: 'true'
+  - name: DRY_RUN
+    value: 'false'
+  - name: VERBOSE
+    value: 'false'
+  - name: PYTHON_VERSION
+    value: '3.11'
+
+pool:
+  vmImage: 'ubuntu-latest'
+
+stages:
+- stage: Validate
+  displayName: 'Validate Configuration'
+  jobs:
+  - job: ValidateConfig
+    displayName: 'Validate Required Variables'
+    steps:
+    - task: Bash@3
+      displayName: 'Check Required Variables'
+      inputs:
+        targetType: 'inline'
+        script: |
+          echo "Validating required environment variables..."
+          
+          # Check required variables
+          required_vars=("GRAPH_TENANT_ID" "GRAPH_CLIENT_ID" "GRAPH_CLIENT_SECRET" "PORT_API_TOKEN")
+          missing_vars=()
+          
+          for var in "${required_vars[@]}"; do
+            if [ -z "${!var:-}" ]; then
+              missing_vars+=("$var")
+            fi
+          done
+          
+          if [ ${#missing_vars[@]} -ne 0 ]; then
+            echo "##vso[task.logissue type=error]Missing required variables: ${missing_vars[*]}"
+            echo "##vso[task.complete result=Failed]"
+            exit 1
+          fi
+          
+          echo "✅ All required variables are set"
+          
+          # Display configuration (without secrets)
+          echo "Configuration:"
+          echo "  GROUP_NAME: ${GROUP_NAME:-'Not set (will use webhook or CLI)'}"
+          echo "  PORT_NOTIFY: ${PORT_NOTIFY:-'true'}"
+          echo "  PORT_ROLE: ${PORT_ROLE:-'Not set'}"
+          echo "  PORT_TEAM_IDS: ${PORT_TEAM_IDS:-'Not set'}"
+          echo "  DRY_RUN: ${DRY_RUN:-'false'}"
+          echo "  VERBOSE: ${VERBOSE:-'false'}"
+        env:
+          GRAPH_TENANT_ID: $(GRAPH_TENANT_ID)
+          GRAPH_CLIENT_ID: $(GRAPH_CLIENT_ID)
+          GRAPH_CLIENT_SECRET: $(GRAPH_CLIENT_SECRET)
+          PORT_API_TOKEN: $(PORT_API_TOKEN)
+          GROUP_NAME: $(GROUP_NAME)
+          PORT_NOTIFY: $(PORT_NOTIFY)
+          PORT_ROLE: $(PORT_ROLE)
+          PORT_TEAM_IDS: $(PORT_TEAM_IDS)
+          DRY_RUN: $(DRY_RUN)
+          VERBOSE: $(VERBOSE)
+
+- stage: Sync
+  displayName: 'Sync Group to Port'
+  dependsOn: Validate
+  condition: succeeded()
+  jobs:
+  - job: SyncGroup
+    displayName: 'Sync Microsoft Entra ID Group to Port.io'
+    steps:
+    - checkout: self
+      fetchDepth: 0
+      displayName: 'Checkout Code'
+    
+    - task: UsePythonVersion@0
+      displayName: 'Setup Python $(PYTHON_VERSION)'
+      inputs:
+        versionSpec: '$(PYTHON_VERSION)'
+        addToPath: true
+    
+    - task: Bash@3
+      displayName: 'Install Dependencies'
+      inputs:
+        targetType: 'inline'
+        script: |
+          echo "Installing Python dependencies..."
+          python -m pip install --upgrade pip
+          pip install msal requests
+          echo "✅ Dependencies installed successfully"
+    
+    - task: Bash@3
+      displayName: 'Check Webhook Payload'
+      inputs:
+        targetType: 'inline'
+        script: |
+          echo "Checking for webhook payload..."
+          if [ -f "$(Build.SourcesDirectory)/payload.json" ]; then
+            echo "✅ Webhook payload found: $(Build.SourcesDirectory)/payload.json"
+            echo "Payload content:"
+            cat "$(Build.SourcesDirectory)/payload.json" | jq . 2>/dev/null || cat "$(Build.SourcesDirectory)/payload.json"
+            export WEBHOOK_PAYLOAD_PATH="$(Build.SourcesDirectory)/payload.json"
+          else
+            echo "ℹ️ No webhook payload found, will use GROUP_NAME variable or CLI argument"
+          fi
+        continueOnError: true
+    
+    - task: Bash@3
+      displayName: 'Sync Group to Port.io'
+      inputs:
+        targetType: 'inline'
+        script: |
+          set -euo pipefail
+          
+          echo "Starting Microsoft Entra ID to Port.io group synchronization..."
+          echo "Timestamp: $(date -u +"%Y-%m-%d %H:%M:%S UTC")"
+          
+          # Build command arguments
+          args=()
+          if [ -n "${GROUP_NAME:-}" ]; then
+            args+=("--group" "$GROUP_NAME")
+          fi
+          if [ "${VERBOSE:-false}" = "true" ]; then
+            args+=("--verbose")
+          fi
+          
+          # Execute the sync script
+          echo "Executing: python sync_group_to_port.py ${args[*]}"
+          python sync_group_to_port.py "${args[@]}"
+          
+          echo "✅ Group synchronization completed successfully"
+        env:
+          GRAPH_TENANT_ID: $(GRAPH_TENANT_ID)
+          GRAPH_CLIENT_ID: $(GRAPH_CLIENT_ID)
+          GRAPH_CLIENT_SECRET: $(GRAPH_CLIENT_SECRET)
+          PORT_API_TOKEN: $(PORT_API_TOKEN)
+          GROUP_NAME: $(GROUP_NAME)
+          PORT_NOTIFY: $(PORT_NOTIFY)
+          PORT_ROLE: $(PORT_ROLE)
+          PORT_TEAM_IDS: $(PORT_TEAM_IDS)
+          DRY_RUN: $(DRY_RUN)
+          VERBOSE: $(VERBOSE)
+          WEBHOOK_PAYLOAD_PATH: $(Build.SourcesDirectory)/payload.json
+        continueOnError: true
+    
+    - task: PublishTestResults@2
+      displayName: 'Publish Test Results'
+      condition: always()
+      inputs:
+        testResultsFormat: 'JUnit'
+        testResultsFiles: '**/test-results.xml'
+        mergeTestResults: true
+        failTaskOnFailedTests: false
+      continueOnError: true
+    
+    - task: PublishBuildArtifacts@1
+      displayName: 'Publish Logs'
+      condition: always()
+      inputs:
+        pathToPublish: '$(Agent.TempDirectory)'
+        artifactName: 'sync-logs'
+        publishLocation: 'Container'
+      continueOnError: true
+
+- stage: Notify
+  displayName: 'Send Notifications'
+  dependsOn: Sync
+  condition: always()
+  jobs:
+  - job: NotifyResults
+    displayName: 'Notify on Results'
+    steps:
+    - task: Bash@3
+      displayName: 'Send Success Notification'
+      condition: eq(variables['Agent.JobStatus'], 'Succeeded')
+      inputs:
+        targetType: 'inline'
+        script: |
+          echo "✅ Microsoft Entra ID to Port.io sync completed successfully"
+          echo "##vso[task.logissue type=warning]Sync completed successfully"
+    
+    - task: Bash@3
+      displayName: 'Send Failure Notification'
+      condition: eq(variables['Agent.JobStatus'], 'Failed')
+      inputs:
+        targetType: 'inline'
+        script: |
+          echo "❌ Microsoft Entra ID to Port.io sync failed"
+          echo "##vso[task.logissue type=error]Sync failed - check logs for details"
