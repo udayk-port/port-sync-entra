@@ -26,7 +26,7 @@ This script bridges the gap between Microsoft Entra ID group management and Port
 
 1. **Clone or download the script**:
    ```bash
-   git clone <repository-url>
+   git clone https://github.com/udayk-port/port-sync-entra
    cd port-sync-entra
    ```
 
